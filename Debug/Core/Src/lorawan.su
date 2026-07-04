@@ -1,0 +1,2 @@
+../Core/Src/lorawan.c:30:6:LoRaWAN_Init	16	static
+../Core/Src/lorawan.c:36:5:LoRaWAN_SendUplink	160	static
