@@ -1,0 +1,18 @@
+#ifndef __LORAWAN_H__
+#define __LORAWAN_H__
+
+#include <stdint.h>
+#include "main.h"
+
+/* Inicializa el stack LoRaWAN ABP con el driver SX1262 ya inicializado.
+ * Debe llamarse DESPUÉS de SX1262_Init(). */
+void LoRaWAN_Init(SPI_HandleTypeDef *hspi);
+
+/* Envía un uplink LoRaWAN no confirmado en el puerto fport.
+ *   data    : payload de aplicación (sin cifrar)
+ *   len     : longitud del payload (máx ~51 bytes para SF7)
+ *   fport   : puerto de aplicación (1-223)
+ * Retorna 0 si OK, -1 si error. */
+int LoRaWAN_SendUplink(const uint8_t *data, uint8_t len, uint8_t fport);
+
+#endif /* __LORAWAN_H__ */

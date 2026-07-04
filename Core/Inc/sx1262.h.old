@@ -1,0 +1,61 @@
+#ifndef __SX1262_H__
+#define __SX1262_H__
+
+#include "main.h"
+#include <stdint.h>
+
+/* Comandos SX1262 (parcial — los esenciales) */
+#define SX126X_CMD_GET_STATUS               0xC0
+#define SX126X_CMD_SET_SLEEP                0x84
+#define SX126X_CMD_SET_STANDBY              0x80
+#define SX126X_CMD_SET_TX                   0x83
+#define SX126X_CMD_SET_RX                   0x82
+#define SX126X_CMD_SET_RF_FREQUENCY         0x86
+#define SX126X_CMD_SET_PACKET_TYPE          0x8A
+#define SX126X_CMD_SET_TX_PARAMS            0x8E
+#define SX126X_CMD_SET_MODULATION_PARAMS    0x8B
+#define SX126X_CMD_SET_PACKET_PARAMS        0x8C
+#define SX126X_CMD_SET_BUFFER_BASE_ADDRESS  0x8F
+#define SX126X_CMD_WRITE_BUFFER             0x0E
+#define SX126X_CMD_READ_BUFFER              0x1E
+#define SX126X_CMD_SET_DIO_IRQ_PARAMS       0x08
+#define SX126X_CMD_GET_IRQ_STATUS           0x12
+#define SX126X_CMD_CLEAR_IRQ_STATUS         0x02
+#define SX126X_CMD_SET_PA_CONFIG            0x95
+#define SX126X_CMD_SET_RX_TX_FALLBACK_MODE  0x93
+#define SX126X_CMD_CALIBRATE                0x89
+#define SX126X_CMD_CALIBRATE_IMAGE          0x98
+#define SX126X_CMD_SET_REGULATOR_MODE       0x96
+#define SX126X_CMD_SET_DIO3_AS_TCXO_CTRL    0x97
+#define SX126X_CMD_GET_DEVICE_ERRORS        0x17
+#define SX126X_CMD_CLEAR_DEVICE_ERRORS      0x07
+#define SX126X_CMD_SET_TX_CONTINUOUS_WAVE   0xD1
+
+#define SX126X_PACKET_TYPE_LORA             0x01
+#define SX126X_STANDBY_RC                   0x00
+#define SX126X_STANDBY_XOSC                 0x01
+
+/* IRQ masks */
+#define SX126X_IRQ_TX_DONE                  (1 << 0)
+#define SX126X_IRQ_RX_DONE                  (1 << 1)
+#define SX126X_IRQ_TIMEOUT                  (1 << 9)
+#define SX126X_IRQ_ALL                      0x3FF
+
+/* API pública */
+typedef enum {
+    SX1262_OK = 0,
+    SX1262_ERR_TIMEOUT,
+    SX1262_ERR_SPI
+} SX1262_Status_t;
+
+SX1262_Status_t SX1262_Init(SPI_HandleTypeDef *hspi);
+SX1262_Status_t SX1262_RecoverAfterXoscError(void);
+SX1262_Status_t SX1262_PrepareForTx(uint8_t payload_len);
+SX1262_Status_t SX1262_SendPacket(uint8_t *data, uint8_t len, uint32_t timeout_ms);
+SX1262_Status_t SX1262_SendTestPacket(void);
+SX1262_Status_t SX1262_RegisterStressTest(void);
+void            SX1262_OnDIO1_IRQ(void);    /* llamar desde EXTI handler */
+void            SX1262_StartCW(void);       /* prueba: onda continua, requiere SX1262_Init() previo */
+void            SX1262_PinHealthCheck(void);/* chequeo de pines NSS/BUSY/DIO1/NRESET + SPI + status */
+
+#endif /* __SX1262_H__ */

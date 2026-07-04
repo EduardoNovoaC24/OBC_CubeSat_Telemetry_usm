@@ -1,0 +1,81 @@
+#include "lorawan.h"
+#include "lorawan_crypto.h"
+#include "sx1262.h"
+#include <string.h>
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * Claves de sesión ABP — de TTN (device stm32-obc-usm)
+ * ⚠️ DevAddr y claves van en el orden de bytes mostrado en TTN (MSB primero).
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/* DevAddr: 260D99FD */
+static const uint32_t DEV_ADDR = 0x260D99FD;
+
+/* NwkSKey: 45EF6BB64ECD7934DF6D401657B08FCD */
+static const uint8_t NWK_SKEY[16] = {
+    0x45,0xEF,0x6B,0xB6,0x4E,0xCD,0x79,0x34,
+    0xDF,0x6D,0x40,0x16,0x57,0xB0,0x8F,0xCD
+};
+
+/* AppSKey: 84E4ECD9065F17A3B0E203F3232835AC */
+static const uint8_t APP_SKEY[16] = {
+    0x84,0xE4,0xEC,0xD9,0x06,0x5F,0x17,0xA3,
+    0xB0,0xE2,0x03,0xF3,0x23,0x28,0x35,0xAC
+};
+
+/* Frame counter uplink — debe incrementar en cada envío.
+ * (En producción se guarda en flash; aquí en RAM, se reinicia al reset.) */
+static uint16_t uplink_fcnt = 0;
+
+void LoRaWAN_Init(SPI_HandleTypeDef *hspi)
+{
+    (void)hspi;  /* el SX1262 ya fue inicializado por SX1262_Init() */
+    uplink_fcnt = 0;
+}
+
+int LoRaWAN_SendUplink(const uint8_t *data, uint8_t len, uint8_t fport)
+{
+    if (len > 51) return -1;  /* límite conservador para SF7/AU915 */
+
+    uint8_t frame[64];
+    uint8_t idx = 0;
+
+    /* ── MHDR: Unconfirmed Data Up (0x40) ───────────────────────────────── */
+    frame[idx++] = 0x40;
+
+    /* ── FHDR ───────────────────────────────────────────────────────────── */
+    /* DevAddr (little-endian) */
+    frame[idx++] = (uint8_t)(DEV_ADDR & 0xFF);
+    frame[idx++] = (uint8_t)((DEV_ADDR >> 8) & 0xFF);
+    frame[idx++] = (uint8_t)((DEV_ADDR >> 16) & 0xFF);
+    frame[idx++] = (uint8_t)((DEV_ADDR >> 24) & 0xFF);
+
+    /* FCtrl: sin ADR, sin opciones (0x00) */
+    frame[idx++] = 0x00;
+
+    /* FCnt (little-endian, 16 bits bajos) */
+    frame[idx++] = (uint8_t)(uplink_fcnt & 0xFF);
+    frame[idx++] = (uint8_t)((uplink_fcnt >> 8) & 0xFF);
+
+    /* ── FPort ──────────────────────────────────────────────────────────── */
+    frame[idx++] = fport;
+
+    /* ── FRMPayload (cifrado con AppSKey) ───────────────────────────────── */
+    uint8_t enc_payload[51];
+    lorawan_encrypt_payload(data, len, DEV_ADDR, uplink_fcnt, APP_SKEY, enc_payload);
+    memcpy(&frame[idx], enc_payload, len);
+    idx += len;
+
+    /* ── MIC (4 bytes, calculado con NwkSKey sobre todo el frame) ───────── */
+    uint8_t mic[4];
+    lorawan_compute_mic(frame, idx, DEV_ADDR, uplink_fcnt, NWK_SKEY, mic);
+    memcpy(&frame[idx], mic, 4);
+    idx += 4;
+
+    /* ── Transmitir por el SX1262 ───────────────────────────────────────── */
+    SX1262_Status_t st = SX1262_SendPacket(frame, idx, 5000);
+
+    uplink_fcnt++;  /* incrementar SIEMPRE, incluso si falla el TX */
+
+    return (st == SX1262_OK) ? 0 : -1;
+}

@@ -1,0 +1,1134 @@
+#include "sx1262.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+#include <stdio.h>
+#include <string.h>
+
+extern UART_HandleTypeDef huart2;
+
+static void SX1262_Log(const char *msg)
+{
+    HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), 100);
+}
+
+/* AU915 FSB2 canal 8 = 916.8 MHz (primero de FSB2: canales 8–15).
+ * Subtel autoriza 915-928 MHz a hasta 500 mW (~27 dBm) — banda ISM legal
+ * en Chile. El cluster TTN correcto para esta región es au1. */
+#define LORA_FREQ_HZ        916800000UL    /* AU915 FSB2 canal 8 */
+#define LORA_TX_POWER_DBM   2              /* [C1] Potencia baja para aislar
+                                            * carga al PA, más fácil aislar fallas.
+                                            * Subir a 22 dBm solo cuando TX_DONE
+                                            * funcione de forma estable. */
+#define LORA_SF             7              /* [C2] SF7 en lugar de SF12.
+                                            * SF12/BW125 → ToA ≈ 2.8 s/paquete,
+                                            * superando el Fair Use Policy de TTN
+                                            * (30 s/día). SF7 → ToA ≈ 56 ms,
+                                            * compatible con TTN y AU915 FSB2
+                                            * que está optimizado para SF7–SF10. */
+#define LORA_BW             4              /* 125 kHz — correcto para AU915 uplink */
+#define LORA_CR             1              /* CR 4/5 */
+/* [C3] LDRO fijo a 0x00 para SF7.
+ * LDRO es obligatorio solo cuando Tsym > 16 ms (SF11/SF12 con BW125).
+ * Con SF7/BW125: Tsym = 2^7/125000 ≈ 1.02 ms << 16 ms → LDRO OFF.
+ * Dejarlo en 0x01 con SF7 produce tramas inválidas que el gateway descarta. */
+#define LORA_LDRO           0x00
+
+#define SX1262_PRE_TX_XOSC_SETTLE_MS        500U
+#define SX1262_TX_TIMEOUT_MS               5000U
+
+/* Timeout de HW del propio comando SetDio3AsTcxoCtrl, en unidades de 15.625us.
+ * 0x001900 (6400) ~= 100 ms. Antes estaba en 0x0000FA (~3.9 ms): ese margen era
+ * insuficiente para que el TCXO se re-estabilice ante el transitorio de
+ * corriente al activar la PA en SET_TX, lo que producia XOSC_START_ERR aun
+ * estando confirmado en STBY_XOSC justo antes. */
+#define SX1262_TCXO_HW_TIMEOUT_UNITS       0x001900U
+
+#define SX1262_TCXO_VOLTAGE_DEFAULT        0x07U   /* 3.3 V */
+#define SX1262_CALIBRATE_WITHOUT_IMAGE     0x3FU
+#define SX1262_RX_TX_FALLBACK_STBY_XOSC    0x30U
+
+static SPI_HandleTypeDef *sx_hspi;
+static SemaphoreHandle_t  txDoneSem;
+static SemaphoreHandle_t  sxMutex;
+
+/* ── Helpers low-level ─────────────────────────────────────────────────── */
+static void SX1262_NSS_Low(void)  { HAL_GPIO_WritePin(SX1262_NSS_GPIO_Port, SX1262_NSS_Pin, GPIO_PIN_RESET); }
+static void SX1262_NSS_High(void) { HAL_GPIO_WritePin(SX1262_NSS_GPIO_Port, SX1262_NSS_Pin, GPIO_PIN_SET);   }
+
+static void SX1262_EndSpiTransaction(void)
+{
+    SX1262_NSS_High();
+    HAL_Delay(1);
+}
+
+static void SX1262_EnsureMutex(void)
+{
+    if (sxMutex == NULL) {
+        sxMutex = xSemaphoreCreateRecursiveMutex();
+    }
+}
+
+static int SX1262_Lock(uint32_t timeout_ms)
+{
+    SX1262_EnsureMutex();
+    if (sxMutex == NULL) {
+        SX1262_Log("[SX] No se pudo crear mutex SX1262\r\n");
+        return 0;
+    }
+    if (xSemaphoreTakeRecursive(sxMutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        SX1262_Log("[SX] Timeout tomando mutex SX1262\r\n");
+        return 0;
+    }
+    return 1;
+}
+
+static void SX1262_Unlock(void)
+{
+    if (sxMutex != NULL) {
+        xSemaphoreGiveRecursive(sxMutex);
+    }
+}
+
+#define SX1262_RETURN_UNLOCK(_status) \
+    do { \
+        SX1262_Unlock(); \
+        return (_status); \
+    } while (0)
+
+static void SX1262_WaitBusy(void)
+{
+    uint32_t start = HAL_GetTick();
+    uint32_t timeout = start + 1000;
+    while (HAL_GPIO_ReadPin(SX1262_BUSY_GPIO_Port, SX1262_BUSY_Pin) == GPIO_PIN_SET) {
+        if (HAL_GetTick() > timeout) {
+            char dbg[48];
+            snprintf(dbg, sizeof(dbg), "[SX] BUSY atascado en alto >%lums\r\n",
+                     (unsigned long)(HAL_GetTick() - start));
+            SX1262_Log(dbg);
+            break;
+        }
+    }
+}
+
+static int SX1262_WaitBusyUntil(uint32_t timeout_ms)
+{
+    uint32_t start = HAL_GetTick();
+    while (HAL_GPIO_ReadPin(SX1262_BUSY_GPIO_Port, SX1262_BUSY_Pin) == GPIO_PIN_SET) {
+        if ((HAL_GetTick() - start) >= timeout_ms) {
+            char dbg[64];
+            snprintf(dbg, sizeof(dbg), "[SX] BUSY timeout tras %lums\r\n",
+                     (unsigned long)(HAL_GetTick() - start));
+            SX1262_Log(dbg);
+            SX1262_NSS_High();
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void SX1262_WriteCmd(uint8_t cmd, uint8_t *data, uint16_t len)
+{
+    SX1262_WaitBusy();
+    SX1262_NSS_Low();
+    HAL_SPI_Transmit(sx_hspi, &cmd, 1, 100);
+    if (len > 0) HAL_SPI_Transmit(sx_hspi, data, len, 100);
+    SX1262_EndSpiTransaction();
+    SX1262_WaitBusy();
+}
+
+static uint8_t SX1262_SPI_TxRx(uint8_t out)
+{
+    uint8_t in = 0;
+    if (HAL_SPI_TransmitReceive(sx_hspi, &out, &in, 1, 100) != HAL_OK) {
+        SX1262_Log("[SX][SPI] TxRx HAL error\r\n");
+    }
+    return in;
+}
+
+static void SX1262_ReadRegisters(uint16_t addr, uint8_t *data, uint16_t len)
+{
+    if (data == NULL || len == 0U) {
+        return;
+    }
+
+    SX1262_WaitBusy();
+    SX1262_NSS_Low();
+    (void)SX1262_SPI_TxRx(0x1D);
+    (void)SX1262_SPI_TxRx((uint8_t)(addr >> 8));
+    (void)SX1262_SPI_TxRx((uint8_t)(addr & 0xFF));
+    (void)SX1262_SPI_TxRx(0x00);
+    for (uint16_t i = 0; i < len; i++) {
+        data[i] = SX1262_SPI_TxRx(0x00);
+    }
+    SX1262_EndSpiTransaction();
+    SX1262_WaitBusy();
+}
+
+static void SX1262_WriteRegisters(uint16_t addr, const uint8_t *data, uint16_t len)
+{
+    if (data == NULL || len == 0U) {
+        return;
+    }
+
+    SX1262_WaitBusy();
+    SX1262_NSS_Low();
+    (void)SX1262_SPI_TxRx(0x0D);
+    (void)SX1262_SPI_TxRx((uint8_t)(addr >> 8));
+    (void)SX1262_SPI_TxRx((uint8_t)(addr & 0xFF));
+    for (uint16_t i = 0; i < len; i++) {
+        (void)SX1262_SPI_TxRx(data[i]);
+    }
+    SX1262_EndSpiTransaction();
+    SX1262_WaitBusy();
+}
+
+static void SX1262_WriteRegisterTrace(uint16_t addr, uint8_t val)
+{
+    uint8_t rx_opcode;
+    uint8_t rx_addr_h;
+    uint8_t rx_addr_l;
+    uint8_t rx_val;
+
+    SX1262_WaitBusy();
+    SX1262_NSS_Low();
+    rx_opcode = SX1262_SPI_TxRx(0x0D);
+    rx_addr_h = SX1262_SPI_TxRx((uint8_t)(addr >> 8));
+    rx_addr_l = SX1262_SPI_TxRx((uint8_t)(addr & 0xFF));
+    rx_val    = SX1262_SPI_TxRx(val);
+    SX1262_EndSpiTransaction();
+    SX1262_WaitBusy();
+
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg),
+             "[SX][SPIREG] W 0x%04X tx=[0D %02X %02X %02X] rx=[%02X %02X %02X %02X]\r\n",
+             addr, (uint8_t)(addr >> 8), (uint8_t)(addr & 0xFF), val,
+             rx_opcode, rx_addr_h, rx_addr_l, rx_val);
+    SX1262_Log(dbg);
+}
+
+static uint8_t SX1262_ReadRegisterTrace(uint16_t addr)
+{
+    uint8_t rx_opcode;
+    uint8_t rx_addr_h;
+    uint8_t rx_addr_l;
+    uint8_t rx_dummy;
+    uint8_t value;
+
+    SX1262_WaitBusy();
+    SX1262_NSS_Low();
+    rx_opcode = SX1262_SPI_TxRx(0x1D);
+    rx_addr_h = SX1262_SPI_TxRx((uint8_t)(addr >> 8));
+    rx_addr_l = SX1262_SPI_TxRx((uint8_t)(addr & 0xFF));
+    rx_dummy  = SX1262_SPI_TxRx(0x00);
+    value     = SX1262_SPI_TxRx(0x00);
+    SX1262_EndSpiTransaction();
+    SX1262_WaitBusy();
+
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg),
+             "[SX][SPIREG] R 0x%04X tx=[1D %02X %02X 00 00] rx=[%02X %02X %02X %02X %02X] val=0x%02X\r\n",
+             addr, (uint8_t)(addr >> 8), (uint8_t)(addr & 0xFF),
+             rx_opcode, rx_addr_h, rx_addr_l, rx_dummy, value, value);
+    SX1262_Log(dbg);
+
+    return value;
+}
+
+static uint8_t SX1262_ReadReg(uint16_t addr)
+{
+    uint8_t val = 0;
+    SX1262_ReadRegisters(addr, &val, 1);
+    return val;
+}
+
+static uint8_t SX1262_ReadRegStable(uint16_t addr)
+{
+    uint8_t prev = SX1262_ReadReg(addr);
+
+    for (uint32_t i = 0; i < 4U; i++) {
+        uint8_t now = SX1262_ReadReg(addr);
+        if (now == prev) {
+            return now;
+        }
+        prev = now;
+    }
+
+    return prev;
+}
+
+static void SX1262_WriteReg(uint16_t addr, uint8_t val)
+{
+    SX1262_WriteRegisters(addr, &val, 1);
+}
+
+static uint8_t SX1262_GetStatusByte(void)
+{
+    uint8_t cmd = SX126X_CMD_GET_STATUS;
+    uint8_t nop = 0x00;
+    uint8_t status = 0;
+
+    if (!SX1262_WaitBusyUntil(1000)) {
+        return 0;
+    }
+    SX1262_NSS_Low();
+    if (HAL_SPI_Transmit(sx_hspi, &cmd, 1, 100) != HAL_OK ||
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &status, 1, 100) != HAL_OK) {
+        status = 0;
+    }
+    SX1262_NSS_High();
+    SX1262_WaitBusyUntil(1000);
+
+    return status;
+}
+
+static uint16_t SX1262_GetDeviceErrors(void)
+{
+    uint8_t cmd = SX126X_CMD_GET_DEVICE_ERRORS;
+    uint8_t nop = 0x00;
+    uint8_t st = 0, err_h = 0, err_l = 0;
+
+    if (!SX1262_WaitBusyUntil(1000)) {
+        return 0xFFFF;
+    }
+    SX1262_NSS_Low();
+    if (HAL_SPI_Transmit(sx_hspi, &cmd, 1, 100) != HAL_OK ||
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &st, 1, 100) != HAL_OK ||
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &err_h, 1, 100) != HAL_OK ||
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &err_l, 1, 100) != HAL_OK) {
+        err_h = 0xFF;
+        err_l = 0xFF;
+    }
+    SX1262_NSS_High();
+    SX1262_WaitBusyUntil(1000);
+
+    return ((uint16_t)err_h << 8) | err_l;
+}
+
+static void SX1262_ClearDeviceErrors(void)
+{
+    uint8_t clr[2] = { 0x00, 0x00 };
+    SX1262_WriteCmd(SX126X_CMD_CLEAR_DEVICE_ERRORS, clr, 2);
+}
+
+static int SX1262_StatusLooksValid(uint8_t status)
+{
+    uint8_t mode = (status >> 4) & 0x07;
+
+    return (status != 0x00U && status != 0xFFU && mode != 0x00U);
+}
+
+static int SX1262_ModeUsesXosc(uint8_t mode)
+{
+    return (mode == 0x03U || mode == 0x04U);
+}
+
+static int SX1262_CheckResponsive(const char *tag)
+{
+    uint8_t status = SX1262_GetStatusByte();
+    uint8_t mode = (status >> 4) & 0x07;
+    char dbg[96];
+
+    snprintf(dbg, sizeof(dbg),
+             "[SX] %s status=0x%02X mode=%u %s\r\n",
+             tag, status, mode,
+             SX1262_StatusLooksValid(status) ? "SPI OK" : "SPI SIN RESPUESTA");
+    SX1262_Log(dbg);
+
+    return SX1262_StatusLooksValid(status);
+}
+
+static int SX1262_EnterStandbyXosc(uint8_t tcxo_voltage, const char *tag)
+{
+    uint8_t standby_rc = SX126X_STANDBY_RC;
+    uint8_t standby_xosc = SX126X_STANDBY_XOSC;
+    uint8_t tcxo_cfg[4] = {
+        tcxo_voltage,
+        (uint8_t)((SX1262_TCXO_HW_TIMEOUT_UNITS >> 16) & 0xFFU),
+        (uint8_t)((SX1262_TCXO_HW_TIMEOUT_UNITS >> 8) & 0xFFU),
+        (uint8_t)(SX1262_TCXO_HW_TIMEOUT_UNITS & 0xFFU)
+    };
+    char dbg[128];
+
+    for (uint32_t attempt = 1U; attempt <= 3U; attempt++) {
+        SX1262_ClearDeviceErrors();
+        SX1262_WriteCmd(SX126X_CMD_SET_STANDBY, &standby_rc, 1);
+        vTaskDelay(pdMS_TO_TICKS(20));
+
+        SX1262_WriteCmd(SX126X_CMD_SET_DIO3_AS_TCXO_CTRL, tcxo_cfg, 4);
+        SX1262_WriteCmd(SX126X_CMD_SET_STANDBY, &standby_xosc, 1);
+        vTaskDelay(pdMS_TO_TICKS(SX1262_PRE_TX_XOSC_SETTLE_MS));
+
+        for (uint32_t sample = 1U; sample <= 5U; sample++) {
+            uint8_t status = SX1262_GetStatusByte();
+            uint8_t mode = (status >> 4) & 0x07;
+            uint16_t err = SX1262_GetDeviceErrors();
+
+            snprintf(dbg, sizeof(dbg),
+                     "[SX] %s XOSC try=%lu sample=%lu volt=0x%02X status=0x%02X mode=%u OpError=0x%04X\r\n",
+                     tag, (unsigned long)attempt, (unsigned long)sample,
+                     tcxo_voltage, status, mode, err);
+            SX1262_Log(dbg);
+
+            if (SX1262_ModeUsesXosc(mode) && (err & 0x0020U) == 0U) {
+                SX1262_ClearDeviceErrors();
+                return 1;
+            }
+
+            if ((err & 0x0020U) != 0U) {
+                break;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    return 0;
+}
+
+static void SX1262_SetRxTxFallbackXosc(void)
+{
+    uint8_t fallback = SX1262_RX_TX_FALLBACK_STBY_XOSC;
+    SX1262_WriteCmd(SX126X_CMD_SET_RX_TX_FALLBACK_MODE, &fallback, 1);
+}
+
+static void SX1262_WriteCriticalTxRegs(void)
+{
+    SX1262_WriteReg(0x0740, 0x34);
+    SX1262_WriteReg(0x0741, 0x44);
+    SX1262_WriteReg(0x08D8, 0xFE);
+    SX1262_WriteReg(0x08E7, 0x38);
+}
+
+static int SX1262_CriticalTxRegsOk(void)
+{
+    uint8_t sw_hi = SX1262_ReadRegStable(0x0740);
+    uint8_t sw_lo = SX1262_ReadRegStable(0x0741);
+    uint8_t clamp = SX1262_ReadRegStable(0x08D8);
+    uint8_t ocp = SX1262_ReadRegStable(0x08E7);
+
+    return (sw_hi == 0x34 && sw_lo == 0x44 && clamp == 0xFE && ocp == 0x38);
+}
+
+static void SX1262_LogTxRegs(const char *tag)
+{
+    uint8_t status = SX1262_GetStatusByte();
+    uint16_t err = SX1262_GetDeviceErrors();
+    uint8_t sw_hi = SX1262_ReadReg(0x0740);
+    uint8_t sw_lo = SX1262_ReadReg(0x0741);
+    uint8_t clamp = SX1262_ReadReg(0x08D8);
+    uint8_t ocp = SX1262_ReadReg(0x08E7);
+    char dbg[160];
+
+    snprintf(dbg, sizeof(dbg),
+             "[SX][SNAP] %s st=0x%02X mode=%u err=0x%04X SW=0x%02X%02X CLAMP=0x%02X OCP=0x%02X\r\n",
+             tag, status, (status >> 4) & 0x07, err, sw_hi, sw_lo, clamp, ocp);
+    SX1262_Log(dbg);
+}
+
+static void SX1262_ApplyTxStaticConfig(void)
+{
+    uint32_t freq_reg = (uint32_t)(((uint64_t)LORA_FREQ_HZ << 25) / 32000000UL);
+    uint8_t freq_buf[4] = {
+        (freq_reg >> 24) & 0xFF,
+        (freq_reg >> 16) & 0xFF,
+        (freq_reg >>  8) & 0xFF,
+         freq_reg        & 0xFF
+    };
+    uint8_t mod[4] = { LORA_SF, LORA_BW, LORA_CR, LORA_LDRO };
+    uint8_t tx_params[2] = { LORA_TX_POWER_DBM, 0x04 };
+    uint8_t irq_cfg[8] = {
+        0x02, 0x01,
+        0x02, 0x01,
+        0x00, 0x00,
+        0x00, 0x00
+    };
+
+    SX1262_WriteCmd(SX126X_CMD_SET_RF_FREQUENCY, freq_buf, 4);
+    SX1262_WriteCmd(SX126X_CMD_SET_MODULATION_PARAMS, mod, 4);
+    SX1262_WriteCmd(SX126X_CMD_SET_TX_PARAMS, tx_params, 2);
+    SX1262_WriteCmd(SX126X_CMD_SET_DIO_IRQ_PARAMS, irq_cfg, 8);
+}
+
+static void SX1262_Reset(void)
+{
+    HAL_GPIO_WritePin(SX1262_NRESET_GPIO_Port, SX1262_NRESET_Pin, GPIO_PIN_RESET);
+    HAL_Delay(20);
+    HAL_GPIO_WritePin(SX1262_NRESET_GPIO_Port, SX1262_NRESET_Pin, GPIO_PIN_SET);
+    HAL_Delay(20);
+
+    {
+        char dbg[48];
+        snprintf(dbg, sizeof(dbg), "[SX] BUSY after reset = %d\r\n",
+                 HAL_GPIO_ReadPin(SX1262_BUSY_GPIO_Port, SX1262_BUSY_Pin));
+        SX1262_Log(dbg);
+    }
+
+    SX1262_WaitBusy();
+
+    {
+        char dbg[48];
+        snprintf(dbg, sizeof(dbg), "[SX] BUSY after wait    = %d\r\n",
+                 HAL_GPIO_ReadPin(SX1262_BUSY_GPIO_Port, SX1262_BUSY_Pin));
+        SX1262_Log(dbg);
+    }
+}
+
+/* ── API pública ───────────────────────────────────────────────────────── */
+SX1262_Status_t SX1262_Init(SPI_HandleTypeDef *hspi)
+{
+    sx_hspi = hspi;
+    if (!SX1262_Lock(2000)) {
+        return SX1262_ERR_TIMEOUT;
+    }
+    if (txDoneSem == NULL) {
+        txDoneSem = xSemaphoreCreateBinary();
+    }
+
+    SX1262_Reset();
+
+    /* Standby RC */
+    uint8_t standby = SX126X_STANDBY_RC;
+    SX1262_WriteCmd(SX126X_CMD_SET_STANDBY, &standby, 1);
+
+    /* Usar LDO para esta prueba: con DC-DC el radio quedaba volviendo a STBY_RC
+     * antes del TX en este modulo/cableado. */
+    {
+        uint8_t regulator = 0x00;
+        SX1262_WriteCmd(SX126X_CMD_SET_REGULATOR_MODE, &regulator, 1);
+        SX1262_Log("[SX] Regulator mode = LDO\r\n");
+    }
+
+    if (!SX1262_CheckResponsive("post standby/regulator")) {
+        SX1262_Log("[SX] Abortando Init: SX1262 no responde por SPI antes de TCXO\r\n");
+        SX1262_RETURN_UNLOCK(SX1262_ERR_SPI);
+    }
+
+    {
+        const uint8_t fallback_voltages[] = { 0x06, 0x05, 0x04, 0x03, 0x02 };
+        int xosc_ok = SX1262_EnterStandbyXosc(SX1262_TCXO_VOLTAGE_DEFAULT, "TCXO default");
+
+        for (uint32_t i = 0U; !xosc_ok && i < (sizeof(fallback_voltages) / sizeof(fallback_voltages[0])); i++) {
+            xosc_ok = SX1262_EnterStandbyXosc(fallback_voltages[i], "TCXO fallback");
+        }
+
+        if (!xosc_ok) {
+            SX1262_Log("[SX] Abortando Init: no se logro STBY_XOSC con ningun voltaje TCXO\r\n");
+            SX1262_RETURN_UNLOCK(SX1262_ERR_TIMEOUT);
+        }
+
+        uint8_t calib_without_image = SX1262_CALIBRATE_WITHOUT_IMAGE;
+        SX1262_WriteCmd(SX126X_CMD_CALIBRATE, &calib_without_image, 1);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        SX1262_ClearDeviceErrors();
+    }
+    HAL_Delay(10);
+
+    /* Packet type: LoRa */
+    uint8_t ptype = SX126X_PACKET_TYPE_LORA;
+    SX1262_WriteCmd(SX126X_CMD_SET_PACKET_TYPE, &ptype, 1);
+    SX1262_LogTxRegs("after packet type");
+
+    /* Sync word público LoRaWAN (0x3444) — registros 0x0740/0x0741.
+     * Se escribe y se verifica con readback; si no coincide, se reintenta
+     * hasta 3 veces (se ha visto leer 0x1424 — sync word privado — en algunos
+     * arranques, lo que hace que el gateway LoRaWAN ignore la transmisión). */
+    {
+        uint8_t sw_hi = 0, sw_lo = 0;
+        int sw_ok = 0;
+
+        for (int attempt = 1; attempt <= 3 && !sw_ok; attempt++) {
+            SX1262_WriteReg(0x0740, 0x34);
+            SX1262_WriteReg(0x0741, 0x44);
+
+            sw_hi = SX1262_ReadReg(0x0740);
+            sw_lo = SX1262_ReadReg(0x0741);
+            sw_ok = (sw_hi == 0x34 && sw_lo == 0x44);
+
+            char dbg[80];
+            snprintf(dbg, sizeof(dbg),
+                "[SX] syncword intento %d: 0x%02X%02X (esperado 0x3444) %s\r\n",
+                attempt, sw_hi, sw_lo, sw_ok ? "<-- OK" : "");
+            SX1262_Log(dbg);
+        }
+    }
+
+    /* DIO2 controla el RF switch de antena (necesario en módulos SX1262) */
+    {
+        uint8_t dio2 = 0x01;
+        SX1262_WriteCmd(0x9D, &dio2, 1);  /* SetDio2AsRfSwitchCtrl */
+    }
+    SX1262_SetRxTxFallbackXosc();
+    SX1262_LogTxRegs("after dio2/fallback");
+
+    /* Frecuencia: AU915 FSB2 canal 8 (916.8 MHz)
+     * freq_reg = (freq * 2^25) / 32_000_000 */
+    uint32_t freq_reg = (uint32_t)(((uint64_t)LORA_FREQ_HZ << 25) / 32000000UL);
+    uint8_t freq_buf[4] = {
+        (freq_reg >> 24) & 0xFF,
+        (freq_reg >> 16) & 0xFF,
+        (freq_reg >>  8) & 0xFF,
+         freq_reg        & 0xFF
+    };
+    SX1262_WriteCmd(SX126X_CMD_SET_RF_FREQUENCY, freq_buf, 4);
+    {
+        uint8_t img_cal[2] = { 0xE1, 0xE9 }; /* 902-928 MHz */
+        SX1262_WriteCmd(SX126X_CMD_CALIBRATE_IMAGE, img_cal, 2);
+        SX1262_Log("[SX] Image calibration 902-928 MHz\r\n");
+    }
+    SX1262_LogTxRegs("after rf/image");
+
+    /* PA config a minimo absoluto (diagnostico): paDutyCycle=0x00, hpMax=0x00.
+     * Prueba para aislar si el transitorio de corriente de la PA al entrar en
+     * TX es lo que tumba al TCXO (XOSC_START_ERR reproducible justo despues
+     * de SET_TX incluso con TCXO ya confirmado en STBY_XOSC). Valor anterior
+     * { 0x02, 0x02, 0x00, 0x01 } (config +14dBm, la mas baja documentada para
+     * SX1262); restaurar una vez descartada/confirmada la hipotesis. */
+    uint8_t pa_cfg[4] = { 0x00, 0x00, 0x00, 0x01 };
+    SX1262_WriteCmd(SX126X_CMD_SET_PA_CONFIG, pa_cfg, 4);
+
+    /* Errata Semtech "Better Resistance of the SX1262 Tx to Antenna Mismatch":
+     * sin este ajuste de TX_CLAMP_CFG (0x08D8), la potencia de salida real del
+     * SX1262 puede quedar muy por debajo de lo configurado, incluso casi nula.
+     * Solo aplica a SX1262 (no a SX1261). */
+    {
+        SX1262_WriteReg(0x08D8, 0xFE);
+    }
+
+    /* OCP (over-current protection) a 160mA para alta potencia (0x08E7).
+     * El valor default es más bajo y puede limitar la corriente real al PA. */
+    SX1262_WriteReg(0x08E7, 0x38);
+
+    /* [C1] 14 dBm para debugging: mismo valor que LORA_TX_POWER_DBM.
+     * Rampa de 200 µs (0x04) — válida para SX1262 según datasheet tabla 13-41. */
+    uint8_t tx_params[2] = { LORA_TX_POWER_DBM, 0x04 /* 200us ramp */ };
+    SX1262_WriteCmd(SX126X_CMD_SET_TX_PARAMS, tx_params, 2);
+
+    /* Modulation: SF/BW/CR configurados arriba, LDRO calculado según SF/BW */
+    uint8_t mod[4] = { LORA_SF, LORA_BW, LORA_CR, LORA_LDRO };
+    SX1262_WriteCmd(SX126X_CMD_SET_MODULATION_PARAMS, mod, 4);
+    SX1262_LogTxRegs("after pa/tx/mod");
+
+    /* Buffer base addresses (TX=0, RX=0) */
+    uint8_t baseaddr[2] = { 0x00, 0x00 };
+    SX1262_WriteCmd(SX126X_CMD_SET_BUFFER_BASE_ADDRESS, baseaddr, 2);
+
+    /* IRQ: TX_DONE | TIMEOUT */
+    uint8_t irq_cfg[8] = {
+        0x02, 0x01,    /* IRQ mask  = TX_DONE(0x001) | TIMEOUT(0x200) */
+        0x02, 0x01,    /* DIO1 mask = TX_DONE | TIMEOUT */
+        0x00, 0x00,    /* DIO2 mask */
+        0x00, 0x00     /* DIO3 mask */
+    };
+    SX1262_WriteCmd(SX126X_CMD_SET_DIO_IRQ_PARAMS, irq_cfg, 8);
+
+    /* ── Verificación real: leer status del chip por SPI ───────────────── */
+    SX1262_WaitBusy();
+    SX1262_NSS_Low();
+    uint8_t cmd_status = SX126X_CMD_GET_STATUS;
+    uint8_t nop = 0x00;
+    uint8_t chip_status = 0;
+    HAL_StatusTypeDef r1 = HAL_SPI_Transmit(sx_hspi, &cmd_status, 1, 100);
+    HAL_StatusTypeDef r2 = HAL_SPI_TransmitReceive(sx_hspi, &nop, &chip_status, 1, 100);
+    SX1262_NSS_High();
+
+    {
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "[SX] status=0x%02X r1=%d r2=%d\r\n", chip_status, r1, r2);
+        SX1262_Log(dbg);
+    }
+
+    if (r1 != HAL_OK || r2 != HAL_OK) {
+        SX1262_Log("[SX] SPI transaction failed (HAL error/timeout)\r\n");
+        SX1262_RETURN_UNLOCK(SX1262_ERR_SPI);
+    }
+
+    /*
+     * Byte de status del SX1262:
+     *   bits [6:4] = chip mode  (0x2=STBY_RC, 0x3=STBY_XOSC, 0x5=TX...)
+     *   bits [3:1] = command status
+     * Chip muerto/desconectado → MISO flotante → 0x00 o 0xFF.
+     */
+    uint8_t mode = (chip_status >> 4) & 0x07;
+
+    if (chip_status == 0x00 || chip_status == 0xFF || mode == 0x00) {
+        SX1262_Log("[SX] status byte indicates chip not responding\r\n");
+        SX1262_RETURN_UNLOCK(SX1262_ERR_SPI);
+    }
+
+    /* [C6-Init] Dejar el chip en STBY_XOSC al terminar el Init.
+     * Si el chip queda en STBY_RC, cada llamada a SET_TX debe re-arrancar
+     * el TCXO, lo que produce XOSC_START_ERR si el oscilador no estabiliza
+     * dentro del timeout (confirmado en log: status=0x00 + OpError=0x0020
+     * inmediatamente después de SET_TX). En STBY_XOSC el TCXO permanece
+     * activo entre transmisiones: SET_TX solo activa PLL y PA. */
+    {
+        uint8_t stby_xosc = 0x01;
+        SX1262_WriteCmd(SX126X_CMD_SET_STANDBY, &stby_xosc, 1);
+        vTaskDelay(pdMS_TO_TICKS(SX1262_PRE_TX_XOSC_SETTLE_MS));
+
+        SX1262_WaitBusy();
+        SX1262_NSS_Low();
+        uint8_t cmd_x = SX126X_CMD_GET_STATUS, nop_x = 0x00, st_x = 0;
+        HAL_SPI_Transmit(sx_hspi, &cmd_x, 1, 100);
+        HAL_SPI_TransmitReceive(sx_hspi, &nop_x, &st_x, 1, 100);
+        SX1262_NSS_High();
+
+        uint8_t mode_x = (st_x >> 4) & 0x07;
+        char dbg_x[80];
+        snprintf(dbg_x, sizeof(dbg_x),
+            "[SX] Init final: status=0x%02X mode=%d (%s)\r\n",
+            st_x, mode_x,
+            SX1262_ModeUsesXosc(mode_x) ? "XOSC/FS OK" : "ADVERTENCIA: no en XOSC/FS");
+        SX1262_Log(dbg_x);
+    }
+    SX1262_SetRxTxFallbackXosc();
+    SX1262_WriteCriticalTxRegs();
+    SX1262_LogTxRegs("init final");
+    if (!SX1262_CriticalTxRegsOk()) {
+        SX1262_Log("[SX] Init final: registros criticos no persistieron\r\n");
+        SX1262_RETURN_UNLOCK(SX1262_ERR_SPI);
+    }
+
+    SX1262_RETURN_UNLOCK(SX1262_OK);
+}
+
+SX1262_Status_t SX1262_RecoverAfterXoscError(void)
+{
+    if (sx_hspi == NULL) {
+        return SX1262_ERR_SPI;
+    }
+    if (!SX1262_Lock(2000)) {
+        return SX1262_ERR_TIMEOUT;
+    }
+
+    SX1262_Log("[SX] Recuperacion XOSC: reset + reinit completo\r\n");
+    SX1262_NSS_High();
+    SX1262_Reset();
+    SX1262_ClearDeviceErrors();
+
+    SX1262_Status_t st = SX1262_Init(sx_hspi);
+    SX1262_RETURN_UNLOCK(st);
+}
+
+SX1262_Status_t SX1262_PrepareForTx(uint8_t payload_len)
+{
+    if (sx_hspi == NULL) {
+        return SX1262_ERR_SPI;
+    }
+    if (!SX1262_Lock(2000)) {
+        return SX1262_ERR_TIMEOUT;
+    }
+    if (!SX1262_WaitBusyUntil(1000)) {
+        SX1262_RETURN_UNLOCK(SX1262_ERR_TIMEOUT);
+    }
+
+    uint8_t pkt_params[6] = {
+        0x00, 0x08,      /* Preamble length = 8 */
+        0x00,            /* Variable length packet */
+        payload_len,
+        0x01,            /* CRC enabled */
+        0x00             /* Standard IQ */
+    };
+    uint8_t clr_irq[2] = { 0xFF, 0xFF };
+    uint8_t stby_xosc = SX126X_STANDBY_XOSC;
+
+    SX1262_WriteCmd(SX126X_CMD_SET_STANDBY, &stby_xosc, 1);
+    HAL_Delay(SX1262_PRE_TX_XOSC_SETTLE_MS);
+
+    uint8_t status = SX1262_GetStatusByte();
+    uint8_t mode = (status >> 4) & 0x07;
+    if (status == 0x00 || status == 0xFF || !SX1262_ModeUsesXosc(mode)) {
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg),
+                 "[SX] PrepareForTx fallo STBY_XOSC: status=0x%02X mode=%u\r\n",
+                 status, mode);
+        SX1262_Log(dbg);
+        (void)SX1262_RecoverAfterXoscError();
+        SX1262_RETURN_UNLOCK(SX1262_ERR_TIMEOUT);
+    }
+
+    uint16_t err = SX1262_GetDeviceErrors();
+    if (err != 0) {
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "[SX] PrepareForTx OpError=0x%04X\r\n", err);
+        SX1262_Log(dbg);
+        if (err & 0x0020) {
+            (void)SX1262_RecoverAfterXoscError();
+            SX1262_RETURN_UNLOCK(SX1262_ERR_TIMEOUT);
+        }
+        SX1262_ClearDeviceErrors();
+        err = SX1262_GetDeviceErrors();
+        if (err != 0) {
+            SX1262_RETURN_UNLOCK(SX1262_ERR_TIMEOUT);
+        }
+    }
+
+    SX1262_ApplyTxStaticConfig();
+    SX1262_WriteCmd(SX126X_CMD_SET_PACKET_PARAMS, pkt_params, 6);
+    SX1262_WriteCmd(SX126X_CMD_CLEAR_IRQ_STATUS, clr_irq, 2);
+
+    SX1262_WriteCriticalTxRegs();
+
+    uint8_t sw_hi = SX1262_ReadRegStable(0x0740);
+    uint8_t sw_lo = SX1262_ReadRegStable(0x0741);
+    uint8_t clamp = SX1262_ReadRegStable(0x08D8);
+    uint8_t ocp = SX1262_ReadRegStable(0x08E7);
+    err = SX1262_GetDeviceErrors();
+    status = SX1262_GetStatusByte();
+    mode = (status >> 4) & 0x07;
+
+    char dbg[160];
+    snprintf(dbg, sizeof(dbg),
+             "[SX] PrepareForTx: BUSY=%d status=0x%02X mode=%u OpError=0x%04X SW=0x%02X%02X CLAMP=0x%02X OCP=0x%02X\r\n",
+             HAL_GPIO_ReadPin(SX1262_BUSY_GPIO_Port, SX1262_BUSY_Pin),
+             status, mode, err, sw_hi, sw_lo, clamp, ocp);
+    SX1262_Log(dbg);
+
+    if (!SX1262_ModeUsesXosc(mode) || err != 0 || sw_hi != 0x34 || sw_lo != 0x44 ||
+        clamp != 0xFE || ocp != 0x38) {
+        SX1262_Log("[SX] PrepareForTx verificacion fallo; reset/reinit\r\n");
+        (void)SX1262_RecoverAfterXoscError();
+        SX1262_RETURN_UNLOCK(SX1262_ERR_TIMEOUT);
+    }
+
+    SX1262_RETURN_UNLOCK(SX1262_OK);
+}
+
+SX1262_Status_t SX1262_SendPacket(uint8_t *data, uint8_t len, uint32_t timeout_ms)
+{
+    if (!SX1262_Lock(2000)) {
+        return SX1262_ERR_TIMEOUT;
+    }
+    SX1262_Status_t prep = SX1262_PrepareForTx(len);
+    if (prep != SX1262_OK) {
+        SX1262_RETURN_UNLOCK(prep);
+    }
+
+    /* Escribir payload al buffer del SX1262 */
+    SX1262_WaitBusy();
+    SX1262_NSS_Low();
+    uint8_t hdr[2] = { SX126X_CMD_WRITE_BUFFER, 0x00 };
+    HAL_SPI_Transmit(sx_hspi, hdr, 2, 100);
+    HAL_SPI_Transmit(sx_hspi, data, len, 100);
+    SX1262_NSS_High();
+    SX1262_WaitBusy();
+    SX1262_LogTxRegs("after write buffer");
+
+    uint8_t pre_status = SX1262_GetStatusByte();
+    uint16_t pre_err = SX1262_GetDeviceErrors();
+    uint8_t pre_mode = (pre_status >> 4) & 0x07;
+    if (!SX1262_ModeUsesXosc(pre_mode) || pre_err != 0U) {
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg),
+                 "[SX] Abortando TX: pre st=0x%02X mode=%u OpError=0x%04X\r\n",
+                 pre_status, pre_mode, pre_err);
+        SX1262_Log(dbg);
+        (void)SX1262_RecoverAfterXoscError();
+        SX1262_RETURN_UNLOCK(SX1262_ERR_TIMEOUT);
+    }
+
+    /* Iniciar TX con timeout HW. Unidad SX1262: 15.625 us = 64 unidades/ms. */
+    uint32_t tx_timeout_units = timeout_ms * 64UL;
+    uint8_t tx_args[3] = {
+        (uint8_t)((tx_timeout_units >> 16) & 0xFF),
+        (uint8_t)((tx_timeout_units >>  8) & 0xFF),
+        (uint8_t)( tx_timeout_units        & 0xFF)
+    };
+    {
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg),
+                 "[SX] SET_TX timeout_hw=%lums units=0x%06lX\r\n",
+                 (unsigned long)timeout_ms,
+                 (unsigned long)(tx_timeout_units & 0xFFFFFFUL));
+        SX1262_Log(dbg);
+    }
+    SX1262_WriteCmd(SX126X_CMD_SET_TX, tx_args, 3);
+
+    /* Diagnóstico: status justo DESPUÉS de SET_TX */
+    {
+        SX1262_WaitBusy();
+        SX1262_NSS_Low();
+        uint8_t cmd_status = SX126X_CMD_GET_STATUS;
+        uint8_t nop = 0x00;
+        uint8_t post_status = 0;
+        HAL_SPI_Transmit(sx_hspi, &cmd_status, 1, 100);
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &post_status, 1, 100);
+        SX1262_NSS_High();
+
+        char dbg[48];
+        snprintf(dbg, sizeof(dbg), "[SX] status DESPUES de SET_TX = 0x%02X\r\n", post_status);
+        SX1262_Log(dbg);
+    }
+
+    /* Diagnóstico: GetDeviceErrors (0x17) — bitmask específico de qué bloque
+     * interno falló (XOSC, PLL, calibraciones, rampa de PA, etc.) */
+    {
+        SX1262_WaitBusy();
+        SX1262_NSS_Low();
+        uint8_t cmd = SX126X_CMD_GET_DEVICE_ERRORS;
+        uint8_t nop = 0x00;
+        uint8_t st = 0, err_h = 0, err_l = 0;
+        HAL_SPI_Transmit(sx_hspi, &cmd, 1, 100);
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &st, 1, 100);
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &err_h, 1, 100);
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &err_l, 1, 100);
+        SX1262_NSS_High();
+
+        uint16_t err = ((uint16_t)err_h << 8) | err_l;
+        char dbg[160];
+        snprintf(dbg, sizeof(dbg),
+            "[SX] OpError=0x%04X RC64K=%d RC13M=%d PLL_CAL=%d ADC_CAL=%d IMG_CAL=%d XOSC_START=%d PLL_LOCK=%d PA_RAMP=%d\r\n",
+            err,
+            (err >> 0) & 1, (err >> 1) & 1, (err >> 2) & 1, (err >> 3) & 1,
+            (err >> 4) & 1, (err >> 5) & 1, (err >> 6) & 1, (err >> 8) & 1);
+        SX1262_Log(dbg);
+
+        if (err & 0x0020) {
+            SX1262_Log("[SX] XOSC_START_ERR despues de SET_TX; reset/reinit\r\n");
+            (void)SX1262_RecoverAfterXoscError();
+            SX1262_RETURN_UNLOCK(SX1262_ERR_TIMEOUT);
+        }
+
+        /* Limpiar errores para no contaminar el siguiente intento */
+        uint8_t clr[2] = { 0x00, 0x00 };
+        SX1262_WriteCmd(SX126X_CMD_CLEAR_DEVICE_ERRORS, clr, 2);
+    }
+
+    /* ── POLLING del registro de IRQ status hasta TX_DONE o timeout ────── */
+    uint32_t start = HAL_GetTick();
+    uint32_t last_log = start;
+    uint32_t iters = 0;
+    uint8_t last_status = 0, last_irq_h = 0, last_irq_l = 0;
+    while ((HAL_GetTick() - start) < timeout_ms)
+    {
+        SX1262_WaitBusy();
+        SX1262_NSS_Low();
+        uint8_t cmd = SX126X_CMD_GET_IRQ_STATUS;
+        uint8_t nop = 0x00;
+        uint8_t status, irq_h, irq_l;
+        HAL_SPI_Transmit(sx_hspi, &cmd, 1, 100);
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &status, 1, 100);
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &irq_h, 1, 100);
+        HAL_SPI_TransmitReceive(sx_hspi, &nop, &irq_l, 1, 100);
+        SX1262_NSS_High();
+
+        iters++;
+        last_status = status; last_irq_h = irq_h; last_irq_l = irq_l;
+
+        if (HAL_GetTick() - last_log >= 500) {
+            char dbg[80];
+            snprintf(dbg, sizeof(dbg), "[SX] TX poll #%lu status=0x%02X irq=0x%02X%02X\r\n",
+                     (unsigned long)iters, status, irq_h, irq_l);
+            SX1262_Log(dbg);
+            last_log = HAL_GetTick();
+        }
+
+        uint16_t irq = ((uint16_t)irq_h << 8) | irq_l;
+
+        if (irq & SX126X_IRQ_TX_DONE) {
+            uint8_t c[2] = { 0xFF, 0xFF };
+            SX1262_WriteCmd(SX126X_CMD_CLEAR_IRQ_STATUS, c, 2);
+            SX1262_Log("[SX] TX_DONE recibido\r\n");
+            SX1262_RETURN_UNLOCK(SX1262_OK);
+        }
+        if (irq & SX126X_IRQ_TIMEOUT) {
+            char dbg[80];
+            snprintf(dbg, sizeof(dbg), "[SX] IRQ_TIMEOUT del chip, status=0x%02X\r\n", status);
+            SX1262_Log(dbg);
+            (void)SX1262_RecoverAfterXoscError();
+            SX1262_RETURN_UNLOCK(SX1262_ERR_TIMEOUT);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    {
+        char dbg[96];
+        snprintf(dbg, sizeof(dbg), "[SX] TX software timeout tras %lu iters, last status=0x%02X irq=0x%02X%02X\r\n",
+                 (unsigned long)iters, last_status, last_irq_h, last_irq_l);
+        SX1262_Log(dbg);
+    }
+    (void)SX1262_RecoverAfterXoscError();
+    SX1262_RETURN_UNLOCK(SX1262_ERR_TIMEOUT);
+}
+
+SX1262_Status_t SX1262_SendTestPacket(void)
+{
+    static uint8_t payload[] = "HELLO_SX1262";
+    SX1262_Log("[SX] TX plano de prueba: HELLO_SX1262\r\n");
+    return SX1262_SendPacket(payload, (uint8_t)(sizeof(payload) - 1U), SX1262_TX_TIMEOUT_MS);
+}
+
+SX1262_Status_t SX1262_RegisterStressTest(void)
+{
+    if (!SX1262_Lock(5000)) {
+        return SX1262_ERR_TIMEOUT;
+    }
+
+    SX1262_Log("[SX][REGTEST] Inicio stress test 100 iteraciones\r\n");
+    SX1262_Log("[SX][SPIREG] Lecturas crudas antes de escribir registros\r\n");
+    (void)SX1262_ReadRegisterTrace(0x0740);
+    (void)SX1262_ReadRegisterTrace(0x0741);
+    (void)SX1262_ReadRegisterTrace(0x08D8);
+    (void)SX1262_ReadRegisterTrace(0x08E7);
+
+    for (uint32_t i = 0; i < 100U; i++) {
+        if (i == 0U) {
+            SX1262_Log("[SX][SPIREG] Iter 0 con trace write/read inmediato\r\n");
+
+            SX1262_WriteRegisterTrace(0x0740, 0x34);
+            (void)SX1262_ReadRegisterTrace(0x0740);
+            (void)SX1262_ReadRegisterTrace(0x0741);
+            (void)SX1262_ReadRegisterTrace(0x08D8);
+            (void)SX1262_ReadRegisterTrace(0x08E7);
+
+            SX1262_WriteRegisterTrace(0x0741, 0x44);
+            (void)SX1262_ReadRegisterTrace(0x0740);
+            (void)SX1262_ReadRegisterTrace(0x0741);
+            (void)SX1262_ReadRegisterTrace(0x08D8);
+            (void)SX1262_ReadRegisterTrace(0x08E7);
+
+            SX1262_WriteRegisterTrace(0x08D8, 0xFE);
+            (void)SX1262_ReadRegisterTrace(0x0740);
+            (void)SX1262_ReadRegisterTrace(0x0741);
+            (void)SX1262_ReadRegisterTrace(0x08D8);
+            (void)SX1262_ReadRegisterTrace(0x08E7);
+
+            SX1262_WriteRegisterTrace(0x08E7, 0x38);
+            (void)SX1262_ReadRegisterTrace(0x0740);
+            (void)SX1262_ReadRegisterTrace(0x0741);
+            (void)SX1262_ReadRegisterTrace(0x08D8);
+            (void)SX1262_ReadRegisterTrace(0x08E7);
+        } else {
+            SX1262_WriteCriticalTxRegs();
+        }
+
+        uint8_t sw_hi = SX1262_ReadRegStable(0x0740);
+        uint8_t sw_lo = SX1262_ReadRegStable(0x0741);
+        uint8_t clamp = SX1262_ReadRegStable(0x08D8);
+        uint8_t ocp = SX1262_ReadRegStable(0x08E7);
+
+        if (sw_hi != 0x34 || sw_lo != 0x44 || clamp != 0xFE || ocp != 0x38) {
+            uint8_t status = SX1262_GetStatusByte();
+            uint16_t err = SX1262_GetDeviceErrors();
+            uint8_t busy = (uint8_t)HAL_GPIO_ReadPin(SX1262_BUSY_GPIO_Port, SX1262_BUSY_Pin);
+            char dbg[180];
+            snprintf(dbg, sizeof(dbg),
+                     "[SX][REGTEST] FAIL iter=%lu BUSY=%u status=0x%02X OpError=0x%04X SW=0x%02X%02X CLAMP=0x%02X OCP=0x%02X\r\n",
+                     (unsigned long)i, busy, status, err, sw_hi, sw_lo, clamp, ocp);
+            SX1262_Log(dbg);
+            SX1262_Log("[SX][REGTEST] Lecturas trace despues de fallo\r\n");
+            (void)SX1262_ReadRegisterTrace(0x0740);
+            (void)SX1262_ReadRegisterTrace(0x0741);
+            (void)SX1262_ReadRegisterTrace(0x08D8);
+            (void)SX1262_ReadRegisterTrace(0x08E7);
+            SX1262_RETURN_UNLOCK(SX1262_ERR_SPI);
+        }
+
+        if ((i % 10U) == 9U) {
+            char dbg[64];
+            snprintf(dbg, sizeof(dbg), "[SX][REGTEST] OK iter=%lu\r\n",
+                     (unsigned long)(i + 1U));
+            SX1262_Log(dbg);
+        }
+    }
+
+    SX1262_Log("[SX][REGTEST] OK 100/100\r\n");
+    SX1262_RETURN_UNLOCK(SX1262_OK);
+}
+
+void SX1262_OnDIO1_IRQ(void)
+{
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(txDoneSem, &xHigherPriorityTaskWoken);
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+void SX1262_StartCW(void)
+{
+    if (!SX1262_Lock(2000)) {
+        return;
+    }
+
+    /* Onda continua sin modulación — aísla la cadena PA/RF-switch/antena
+     * del protocolo LoRaWAN. Requiere que SX1262_Init() ya haya corrido
+     * (TCXO, frecuencia, PA config, potencia ya configurados). */
+    SX1262_Log("[SX] Iniciando CW (onda continua)...\r\n");
+    SX1262_WriteCmd(SX126X_CMD_SET_TX_CONTINUOUS_WAVE, NULL, 0);
+    SX1262_Log("[SX] CW activo. Detener con reset/reflash cuando termines de medir.\r\n");
+    SX1262_Unlock();
+}
+
+void SX1262_PinHealthCheck(void)
+{
+    if (!SX1262_Lock(2000)) {
+        return;
+    }
+
+    char dbg[180];
+
+    /* 1) Niveles de los pines de control vistos por el STM32 en reposo.
+     * Esperado en reposo: NSS=1(alto/deseleccionado), BUSY=0, DIO1=0, NRESET=1 */
+    int nss    = HAL_GPIO_ReadPin(SX1262_NSS_GPIO_Port, SX1262_NSS_Pin);
+    int busy   = HAL_GPIO_ReadPin(SX1262_BUSY_GPIO_Port, SX1262_BUSY_Pin);
+    int dio1   = HAL_GPIO_ReadPin(SX1262_DIO1_GPIO_Port, SX1262_DIO1_Pin);
+    int nreset = HAL_GPIO_ReadPin(SX1262_NRESET_GPIO_Port, SX1262_NRESET_Pin);
+
+    snprintf(dbg, sizeof(dbg),
+        "[SX][PINCHECK] NSS=%d BUSY=%d DIO1=%d NRESET=%d (esperado reposo: 1,0,0,1)\r\n",
+        nss, busy, dio1, nreset);
+    SX1262_Log(dbg);
+
+    /* 2) Read-back del sync word (registros 0x0740/0x0741) — confirma que
+     * SCK/MOSI/MISO transportan datos reales en ambas direcciones. */
+    uint8_t sw_hi = SX1262_ReadReg(0x0740);
+    uint8_t sw_lo = SX1262_ReadReg(0x0741);
+    int spi_ok = (sw_hi == 0x34 && sw_lo == 0x44);
+
+    /* 3) GetStatus — decodifica modo (bits[6:4]) y command status (bits[3:1]).
+     * cmd_status==5 significa "Failure to execute command" (falla real),
+     * no basta con descartar solo 0x00/0xFF. */
+    SX1262_WaitBusy();
+    SX1262_NSS_Low();
+    uint8_t cmd_status = SX126X_CMD_GET_STATUS;
+    uint8_t nop = 0x00;
+    uint8_t chip_status = 0;
+    HAL_SPI_Transmit(sx_hspi, &cmd_status, 1, 100);
+    HAL_SPI_TransmitReceive(sx_hspi, &nop, &chip_status, 1, 100);
+    SX1262_NSS_High();
+    SX1262_WaitBusy();
+    uint8_t cs_mode = (chip_status >> 4) & 0x07;
+    uint8_t cs_cmd  = (chip_status >> 1) & 0x07;
+    int status_ok = (chip_status != 0x00 && chip_status != 0xFF && cs_cmd != 0x05);
+
+    /* 4) GetDeviceErrors */
+    SX1262_WaitBusy();
+    SX1262_NSS_Low();
+    uint8_t cmd_err = SX126X_CMD_GET_DEVICE_ERRORS;
+    uint8_t err_status = 0, err_h = 0, err_l = 0;
+    HAL_SPI_Transmit(sx_hspi, &cmd_err, 1, 100);
+    HAL_SPI_TransmitReceive(sx_hspi, &nop, &err_status, 1, 100);
+    HAL_SPI_TransmitReceive(sx_hspi, &nop, &err_h, 1, 100);
+    HAL_SPI_TransmitReceive(sx_hspi, &nop, &err_l, 1, 100);
+    SX1262_NSS_High();
+    SX1262_WaitBusy();
+    uint16_t err = ((uint16_t)err_h << 8) | err_l;
+
+    snprintf(dbg, sizeof(dbg),
+        "[SX][PINCHECK] SPI readback=%s(0x%02X%02X) status=0x%02X mode=%d cmd_status=%d(%s) OpError=0x%04X(%s)\r\n",
+        spi_ok ? "OK" : "FAIL", sw_hi, sw_lo,
+        chip_status, cs_mode, cs_cmd, status_ok ? "OK" : "FAIL",
+        err, err == 0 ? "limpio" : "con_errores");
+    SX1262_Log(dbg);
+
+    /* 5) Registro TX_CLAMP_CFG y OCP — confirma que el fix de errata sigue aplicado */
+    uint8_t clamp = SX1262_ReadReg(0x08D8);
+    uint8_t ocp   = SX1262_ReadReg(0x08E7);
+    snprintf(dbg, sizeof(dbg),
+        "[SX][PINCHECK] TX_CLAMP_CFG=0x%02X (bits[4:1] esperados=1111) OCP=0x%02X (esperado 0x38)\r\n",
+        clamp, ocp);
+    SX1262_Log(dbg);
+
+    SX1262_Unlock();
+}
